@@ -1,0 +1,4 @@
+# Force LF line endings for shell scripts so they run on Linux without
+# "/usr/bin/env: 'bash\r'" errors when checked out on Windows then synced.
+*.sh text eol=lf
+scripts/setup.mjs text eol=lf
