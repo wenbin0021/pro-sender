@@ -4,24 +4,17 @@ import type {
   Campaign,
   MessageLog,
   MessageStatus,
+  CampaignStatus,
   HlrResult,
   HlrReport,
 } from "./types";
-import { lookupNumbers } from "./hlr";
+import { db } from "./db";
 
-// In-memory mock store. Stands in for a real database so the skeleton runs
-// with zero setup. Swap each function body for real DB queries when ready.
-//
-// Attached to globalThis so the data survives Next.js dev-mode HMR reloads.
+// SQLite-backed store. All functions are synchronous because better-sqlite3
+// is synchronous — keeps the existing API routes unchanged.
 
-interface Db {
-  contacts: Contact[];
-  templates: Template[];
-  campaigns: Campaign[];
-  logs: MessageLog[];
-  hlrReports: HlrReport[];
-  // Account credit balance, in SGD.
-  balance: number;
+function id(prefix: string): string {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function summarizeHlr(results: HlrResult[]) {
@@ -33,173 +26,88 @@ function summarizeHlr(results: HlrResult[]) {
   };
 }
 
-const globalForDb = globalThis as unknown as { __smsDb?: Db };
-
-function id(prefix: string): string {
-  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function seed(): Db {
-  const now = Date.now();
-  const DAY = 86400000;
-  const iso = (offsetMs: number) => new Date(now - offsetMs).toISOString();
-
-  const contacts: Contact[] = [
-    { id: "c1", name: "Alice Tan", phone: "+6591234567", group: "vip", status: "subscribed", createdAt: iso(DAY * 21) },
-    { id: "c2", name: "Bob Lim", phone: "+6598765432", group: "vip", status: "subscribed", createdAt: iso(DAY * 20) },
-    { id: "c3", name: "Carol Ng", phone: "+6590001111", group: "newsletter", status: "subscribed", createdAt: iso(DAY * 18) },
-    { id: "c4", name: "David Wong", phone: "+6592223333", group: "newsletter", status: "unsubscribed", createdAt: iso(DAY * 17) },
-    { id: "c5", name: "Eve Chua", phone: "+6594445555", group: "newsletter", status: "subscribed", createdAt: iso(DAY * 15) },
-    { id: "c6", name: "Frank Goh", phone: "+6596667777", group: "vip", status: "subscribed", createdAt: iso(DAY * 12) },
-    { id: "c7", name: "Grace Teo", phone: "+6593334444", group: "onboarding", status: "subscribed", createdAt: iso(DAY * 9) },
-    { id: "c8", name: "Henry Koh", phone: "+6595556666", group: "onboarding", status: "subscribed", createdAt: iso(DAY * 6) },
-    { id: "c9", name: "Iris Sim", phone: "+6597778888", group: "newsletter", status: "subscribed", createdAt: iso(DAY * 4) },
-    { id: "c10", name: "Jack Lau", phone: "+6598889999", group: "onboarding", status: "subscribed", createdAt: iso(DAY * 2) },
-  ];
-
-  const templates: Template[] = [
-    { id: "t1", name: "Welcome", body: "Hi {{name}}, welcome aboard! Reply STOP to opt out.", createdAt: iso(DAY * 21) },
-    { id: "t2", name: "Promo", body: "Hi {{name}}, enjoy 20% off this week only. Reply STOP to opt out.", createdAt: iso(DAY * 11) },
-    { id: "t3", name: "Reminder", body: "Hi {{name}}, your appointment is tomorrow. Reply STOP to opt out.", createdAt: iso(DAY * 5) },
-  ];
-
-  // Historical campaigns + their message logs, spread across the last week so
-  // the dashboard charts and reports have something to show on first load.
-  const campaigns: Campaign[] = [];
-  const logs: MessageLog[] = [];
-
-  const history: Array<{
-    name: string;
-    templateId: string;
-    group: string;
-    daysAgo: number;
-    recipients: number;
-  }> = [
-    { name: "Onboarding wave 1", templateId: "t1", group: "onboarding", daysAgo: 6, recipients: 14 },
-    { name: "Weekend promo", templateId: "t2", group: "newsletter", daysAgo: 4, recipients: 28 },
-    { name: "VIP early access", templateId: "t2", group: "vip", daysAgo: 2, recipients: 19 },
-    { name: "Appointment reminders", templateId: "t3", group: "onboarding", daysAgo: 1, recipients: 22 },
-  ];
-
-  const rollStatus = (): MessageStatus => {
-    const r = Math.random();
-    if (r < 0.78) return "sent";
-    if (r < 0.87) return "failed";
-    if (r < 0.93) return "pending";
-    if (r < 0.97) return "unknown";
-    return "invalid";
-  };
-
-  for (const h of history) {
-    const campaignId = id("camp");
-    const tpl = templates.find((t) => t.id === h.templateId)!;
-    const counts = { sent: 0, failed: 0, pending: 0, invalid: 0, unknown: 0 };
-
-    for (let i = 0; i < h.recipients; i++) {
-      const status = rollStatus();
-      counts[status]++;
-      const contact = contacts[i % contacts.length];
-      const contactName = contact.name ?? contact.phone;
-      logs.push({
-        id: id("msg"),
-        campaignId,
-        contactId: contact.id,
-        contactName,
-        phone: status === "invalid" ? `${contact.phone}-x` : contact.phone,
-        body: tpl.body.replace(/\{\{\s*name\s*\}\}/g, contactName),
-        status,
-        error:
-          status === "failed"
-            ? "Carrier rejected message"
-            : status === "invalid"
-              ? "Invalid phone number format"
-              : status === "unknown"
-                ? "No delivery receipt"
-                : undefined,
-        providerMessageId:
-          status === "invalid"
-            ? undefined
-            : `mock_${Math.random().toString(36).slice(2, 12)}`,
-        createdAt: iso(DAY * h.daysAgo - i * 60000),
-      });
-    }
-
-    campaigns.push({
-      id: campaignId,
-      name: h.name,
-      message: tpl.body,
-      group: h.group,
-      status: "completed",
-      total: h.recipients,
-      ...counts,
-      createdAt: iso(DAY * h.daysAgo),
-    });
-  }
-
-  // Seed a couple of HLR reports so the lookup history and the Send Now
-  // recipient picker have content on first load.
-  const genPhones = (base: number, count: number, bad: number) => {
-    const arr: string[] = [];
-    for (let i = 0; i < count; i++) arr.push(`+65${base + i}`);
-    for (let i = 0; i < bad; i++) arr.push(`bad-${i}`);
-    return arr;
-  };
-  const hlrSeed = [
-    { name: "Q2 leads cleanup", daysAgo: 5, phones: genPhones(91230000, 16, 2) },
-    { name: "Newsletter list check", daysAgo: 2, phones: genPhones(98450000, 12, 1) },
-  ];
-  const hlrReports: HlrReport[] = hlrSeed.map((h) => {
-    const results = lookupNumbers(h.phones);
-    return {
-      id: id("hlr"),
-      name: h.name,
-      createdAt: iso(DAY * h.daysAgo),
-      ...summarizeHlr(results),
-      results,
-    };
-  });
-
-  return { contacts, templates, campaigns, logs, hlrReports, balance: 128.5 };
-}
-
-function db(): Db {
-  if (!globalForDb.__smsDb) globalForDb.__smsDb = seed();
-  return globalForDb.__smsDb;
-}
-
 // --- Contacts & groups ---
-export function contactsByGroup(group: string): Contact[] {
-  return db()
-    .contacts.filter((c) => c.group === group)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+interface ContactRow {
+  id: string;
+  name: string | null;
+  phone: string;
+  group: string;
+  status: "subscribed" | "unsubscribed";
+  createdAt: string;
 }
 
-// Bulk-imports phone numbers into a group, skipping numbers already present in
-// that group. Returns only the contacts that were actually created.
+function rowToContact(r: ContactRow): Contact {
+  return {
+    id: r.id,
+    name: r.name ?? undefined,
+    phone: r.phone,
+    group: r.group,
+    status: r.status,
+    createdAt: r.createdAt,
+  };
+}
+
+export function contactsByGroup(group: string): Contact[] {
+  const rows = db()
+    .prepare<[string], ContactRow>(
+      `SELECT id, name, phone, "group" as "group", status, createdAt
+       FROM contacts WHERE "group" = ? ORDER BY createdAt DESC`,
+    )
+    .all(group);
+  return rows.map(rowToContact);
+}
+
 export function addContactsToGroup(group: string, phones: string[]): Contact[] {
-  const existing = new Set(
-    db().contacts.filter((c) => c.group === group).map((c) => c.phone),
-  );
   const created: Contact[] = [];
-  for (const phone of phones) {
-    if (existing.has(phone)) continue;
-    existing.add(phone);
-    const contact: Contact = {
-      id: id("c"),
-      phone,
-      group,
-      status: "subscribed",
-      createdAt: new Date().toISOString(),
-    };
-    db().contacts.push(contact);
-    created.push(contact);
-  }
+  const insert = db().prepare(
+    `INSERT OR IGNORE INTO contacts (id, name, phone, "group", status, createdAt)
+     VALUES (?, NULL, ?, ?, 'subscribed', ?)`,
+  );
+  const tx = db().transaction(() => {
+    for (const phone of phones) {
+      const newId = id("c");
+      const createdAt = new Date().toISOString();
+      const info = insert.run(newId, phone, group, createdAt);
+      if (info.changes > 0) {
+        created.push({
+          id: newId,
+          phone,
+          group,
+          status: "subscribed",
+          createdAt,
+        });
+      }
+    }
+  });
+  tx();
   return created;
 }
 
+export function listGroups(): string[] {
+  const rows = db()
+    .prepare<[], { group: string }>(
+      `SELECT DISTINCT "group" as "group" FROM contacts ORDER BY "group" ASC`,
+    )
+    .all();
+  return rows.map((r) => r.group);
+}
+
 // --- Templates ---
+
+interface TemplateRow {
+  id: string;
+  name: string;
+  body: string;
+  createdAt: string;
+}
+
 export function listTemplates(): Template[] {
-  return [...db().templates].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return db()
+    .prepare<[], TemplateRow>(
+      `SELECT id, name, body, createdAt FROM templates ORDER BY createdAt DESC`,
+    )
+    .all();
 }
 
 export function createTemplate(input: Pick<Template, "name" | "body">): Template {
@@ -209,17 +117,70 @@ export function createTemplate(input: Pick<Template, "name" | "body">): Template
     body: input.body,
     createdAt: new Date().toISOString(),
   };
-  db().templates.push(template);
+  db()
+    .prepare(
+      `INSERT INTO templates (id, name, body, createdAt) VALUES (?, ?, ?, ?)`,
+    )
+    .run(template.id, template.name, template.body, template.createdAt);
   return template;
 }
 
 // --- Campaigns ---
+
+interface CampaignRow {
+  id: string;
+  name: string;
+  message: string | null;
+  senderId: string | null;
+  group: string;
+  status: CampaignStatus;
+  total: number;
+  sent: number;
+  failed: number;
+  pending: number;
+  invalid: number;
+  unknown: number;
+  createdAt: string;
+}
+
+function rowToCampaign(r: CampaignRow): Campaign {
+  return {
+    id: r.id,
+    name: r.name,
+    message: r.message ?? undefined,
+    senderId: r.senderId ?? undefined,
+    group: r.group,
+    status: r.status,
+    total: r.total,
+    sent: r.sent,
+    failed: r.failed,
+    pending: r.pending,
+    invalid: r.invalid,
+    unknown: r.unknown,
+    createdAt: r.createdAt,
+  };
+}
+
 export function listCampaigns(): Campaign[] {
-  return [...db().campaigns].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rows = db()
+    .prepare<[], CampaignRow>(
+      `SELECT id, name, message, senderId, "group" as "group", status,
+              total, sent, failed, pending, invalid, unknown, createdAt
+       FROM campaigns ORDER BY createdAt DESC`,
+    )
+    .all();
+  return rows.map(rowToCampaign);
 }
 
 export function getCampaign(campaignId: string): Campaign | undefined {
-  return db().campaigns.find((c) => c.id === campaignId);
+  const row = db()
+    .prepare<[string], CampaignRow>(
+      `SELECT id, name, message, senderId, "group" as "group", status,
+              total, sent, failed, pending, invalid, unknown, createdAt
+       FROM campaigns WHERE id = ?`,
+    )
+    .get(campaignId);
+  return row ? rowToCampaign(row) : undefined;
 }
 
 export function createCampaign(
@@ -241,61 +202,290 @@ export function createCampaign(
     unknown: 0,
     createdAt: new Date().toISOString(),
   };
-  db().campaigns.push(campaign);
+  db()
+    .prepare(
+      `INSERT INTO campaigns
+         (id, name, message, senderId, "group", status, total, sent, failed, pending, invalid, unknown, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?)`,
+    )
+    .run(
+      campaign.id,
+      campaign.name,
+      campaign.message ?? null,
+      campaign.senderId ?? null,
+      campaign.group,
+      campaign.status,
+      campaign.createdAt,
+    );
   return campaign;
 }
 
-export function updateCampaign(campaignId: string, patch: Partial<Campaign>): void {
-  const campaign = db().campaigns.find((c) => c.id === campaignId);
-  if (campaign) Object.assign(campaign, patch);
+const ALLOWED_CAMPAIGN_FIELDS = new Set([
+  "name",
+  "message",
+  "senderId",
+  "group",
+  "status",
+  "total",
+  "sent",
+  "failed",
+  "pending",
+  "invalid",
+  "unknown",
+]);
+
+export function updateCampaign(
+  campaignId: string,
+  patch: Partial<Campaign>,
+): void {
+  const entries = Object.entries(patch).filter(
+    ([k, v]) => ALLOWED_CAMPAIGN_FIELDS.has(k) && v !== undefined,
+  );
+  if (entries.length === 0) return;
+  const sets = entries.map(([k]) => `"${k}" = ?`).join(", ");
+  const values = entries.map(([, v]) => v as string | number | null);
+  db()
+    .prepare(`UPDATE campaigns SET ${sets} WHERE id = ?`)
+    .run(...values, campaignId);
 }
 
 // --- Logs ---
+
+interface LogRow {
+  id: string;
+  campaignId: string;
+  contactId: string;
+  contactName: string;
+  phone: string;
+  body: string;
+  status: MessageStatus;
+  error: string | null;
+  providerMessageId: string | null;
+  createdAt: string;
+}
+
+function rowToLog(r: LogRow): MessageLog {
+  return {
+    id: r.id,
+    campaignId: r.campaignId,
+    contactId: r.contactId,
+    contactName: r.contactName,
+    phone: r.phone,
+    body: r.body,
+    status: r.status,
+    error: r.error ?? undefined,
+    providerMessageId: r.providerMessageId ?? undefined,
+    createdAt: r.createdAt,
+  };
+}
+
 export function listLogs(campaignId?: string): MessageLog[] {
-  const logs = campaignId ? db().logs.filter((l) => l.campaignId === campaignId) : db().logs;
-  return [...logs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const sql = `SELECT id, campaignId, contactId, contactName, phone, body,
+                      status, error, providerMessageId, createdAt
+               FROM message_logs
+               ${campaignId ? "WHERE campaignId = ?" : ""}
+               ORDER BY createdAt DESC`;
+  const rows = campaignId
+    ? db().prepare<[string], LogRow>(sql).all(campaignId)
+    : db().prepare<[], LogRow>(sql).all();
+  return rows.map(rowToLog);
 }
 
 export function addLog(log: Omit<MessageLog, "id" | "createdAt">): MessageLog {
-  const entry: MessageLog = { ...log, id: id("msg"), createdAt: new Date().toISOString() };
-  db().logs.push(entry);
+  const entry: MessageLog = {
+    ...log,
+    id: id("msg"),
+    createdAt: new Date().toISOString(),
+  };
+  db()
+    .prepare(
+      `INSERT INTO message_logs
+         (id, campaignId, contactId, contactName, phone, body, status, error, providerMessageId, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      entry.id,
+      entry.campaignId,
+      entry.contactId,
+      entry.contactName,
+      entry.phone,
+      entry.body,
+      entry.status,
+      entry.error ?? null,
+      entry.providerMessageId ?? null,
+      entry.createdAt,
+    );
   return entry;
 }
 
-// Distinct contact groups, for populating select dropdowns.
-export function listGroups(): string[] {
-  return [...new Set(db().contacts.map((c) => c.group))].sort();
+// Recompute a campaign's sent/failed/pending/invalid/unknown counters from
+// its log rows. Called after a webhook flips a log's status.
+function recomputeCampaignCounts(campaignId: string): void {
+  const counts = db()
+    .prepare<
+      [string],
+      {
+        sent: number;
+        failed: number;
+        pending: number;
+        invalid: number;
+        unknown: number;
+      }
+    >(
+      `SELECT
+         SUM(status = 'sent')    AS sent,
+         SUM(status = 'failed')  AS failed,
+         SUM(status = 'pending') AS pending,
+         SUM(status = 'invalid') AS invalid,
+         SUM(status = 'unknown') AS unknown
+       FROM message_logs WHERE campaignId = ?`,
+    )
+    .get(campaignId);
+
+  if (!counts) return;
+  const sent = counts.sent ?? 0;
+  const pending = counts.pending ?? 0;
+  const status: CampaignStatus =
+    pending > 0 ? "sending" : sent === 0 ? "failed" : "completed";
+
+  db()
+    .prepare(
+      `UPDATE campaigns
+         SET sent = ?, failed = ?, pending = ?, invalid = ?, unknown = ?, status = ?
+         WHERE id = ?`,
+    )
+    .run(
+      sent,
+      counts.failed ?? 0,
+      pending,
+      counts.invalid ?? 0,
+      counts.unknown ?? 0,
+      status,
+      campaignId,
+    );
+}
+
+export function updateLogByProviderId(
+  providerMessageId: string,
+  patch: Partial<Pick<MessageLog, "status" | "error">>,
+): boolean {
+  if (!providerMessageId) return false;
+  const row = db()
+    .prepare<[string], { id: string; campaignId: string }>(
+      `SELECT id, campaignId FROM message_logs WHERE providerMessageId = ? LIMIT 1`,
+    )
+    .get(providerMessageId);
+  if (!row) return false;
+
+  const sets: string[] = [];
+  const values: (string | null)[] = [];
+  if (patch.status) {
+    sets.push("status = ?");
+    values.push(patch.status);
+  }
+  if (patch.error !== undefined) {
+    sets.push("error = ?");
+    values.push(patch.error ?? null);
+  }
+  if (sets.length === 0) return true;
+
+  db()
+    .prepare(`UPDATE message_logs SET ${sets.join(", ")} WHERE id = ?`)
+    .run(...values, row.id);
+  recomputeCampaignCounts(row.campaignId);
+  return true;
 }
 
 // --- HLR reports ---
+
+interface HlrReportRow {
+  id: string;
+  name: string;
+  createdAt: string;
+  total: number;
+  valid: number;
+  invalid: number;
+  absent: number;
+  results: string;
+}
+
+function rowToHlrReport(r: HlrReportRow): HlrReport {
+  return {
+    id: r.id,
+    name: r.name,
+    createdAt: r.createdAt,
+    total: r.total,
+    valid: r.valid,
+    invalid: r.invalid,
+    absent: r.absent,
+    results: JSON.parse(r.results) as HlrResult[],
+  };
+}
+
 export function listHlrReports(): HlrReport[] {
-  return [...db().hlrReports].sort((a, b) =>
-    b.createdAt.localeCompare(a.createdAt),
-  );
+  return db()
+    .prepare<[], HlrReportRow>(
+      `SELECT id, name, createdAt, total, valid, invalid, absent, results
+       FROM hlr_reports ORDER BY createdAt DESC`,
+    )
+    .all()
+    .map(rowToHlrReport);
 }
 
 export function getHlrReport(reportId: string): HlrReport | undefined {
-  return db().hlrReports.find((r) => r.id === reportId);
+  const row = db()
+    .prepare<[string], HlrReportRow>(
+      `SELECT id, name, createdAt, total, valid, invalid, absent, results
+       FROM hlr_reports WHERE id = ?`,
+    )
+    .get(reportId);
+  return row ? rowToHlrReport(row) : undefined;
 }
 
 export function createHlrReport(name: string, results: HlrResult[]): HlrReport {
+  const summary = summarizeHlr(results);
   const report: HlrReport = {
     id: id("hlr"),
     name,
     createdAt: new Date().toISOString(),
-    ...summarizeHlr(results),
+    ...summary,
     results,
   };
-  db().hlrReports.push(report);
+  db()
+    .prepare(
+      `INSERT INTO hlr_reports (id, name, createdAt, total, valid, invalid, absent, results)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      report.id,
+      report.name,
+      report.createdAt,
+      report.total,
+      report.valid,
+      report.invalid,
+      report.absent,
+      JSON.stringify(report.results),
+    );
   return report;
 }
 
 // --- Billing ---
+
 export function getBalance(): number {
-  return db().balance;
+  const row = db()
+    .prepare<[], { value: string }>(`SELECT value FROM kv WHERE key = 'balance'`)
+    .get();
+  return row ? Number(row.value) : 0;
 }
 
 export function addBalance(amount: number): number {
-  db().balance = Math.round((db().balance + amount) * 100) / 100;
-  return db().balance;
+  const tx = db().transaction((delta: number): number => {
+    const current = getBalance();
+    const next = Math.round((current + delta) * 100) / 100;
+    db()
+      .prepare(`UPDATE kv SET value = ? WHERE key = 'balance'`)
+      .run(String(next));
+    return next;
+  });
+  return tx(amount);
 }

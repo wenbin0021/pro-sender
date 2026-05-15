@@ -6,6 +6,10 @@ import type { MessageStatus } from "@/lib/types";
 // Ad-hoc "Send Now" blast: free-text message + a raw list of phone numbers,
 // no template or saved contact group required. Produces a campaign report
 // with a per-outcome breakdown (sent / failed / pending / invalid / unknown).
+//
+// Sends one-by-one for small lists, or via the provider's broadcast endpoint
+// (when available) for larger lists. Threshold is configurable via
+// MMDSMART_BROADCAST_THRESHOLD.
 export async function POST(request: Request) {
   const body = await request.json();
   const message = String(body.message ?? "").trim();
@@ -68,26 +72,65 @@ export async function POST(request: Request) {
     });
   }
 
-  // Sent synchronously because the mock provider is fast. A production build
-  // should queue this and reconcile pending/unknown via delivery webhooks.
   const provider = getProvider();
-  for (const phone of valid) {
-    const result = await provider.send(phone, message, { senderId });
-    counts[result.status]++;
-    addLog({
-      campaignId: campaign.id,
-      contactId: "manual",
-      contactName: "Manual recipient",
-      phone,
-      body: message,
-      status: result.status,
-      error: result.error,
-      providerMessageId: result.providerMessageId,
+  const threshold = Math.max(
+    1,
+    Number(process.env.MMDSMART_BROADCAST_THRESHOLD ?? "5"),
+  );
+  const useBroadcast =
+    typeof provider.sendBroadcast === "function" && valid.length > threshold;
+
+  if (useBroadcast && provider.sendBroadcast) {
+    // One round-trip for the whole batch. Per-recipient delivery status will
+    // be reconciled later via webhook callbacks.
+    const result = await provider.sendBroadcast(valid, message, {
+      senderId,
+      clientRef: campaign.id,
     });
+    for (const r of result.recipients) {
+      counts[r.status]++;
+      addLog({
+        campaignId: campaign.id,
+        contactId: "manual",
+        contactName: "Manual recipient",
+        phone: r.phone,
+        body: message,
+        status: r.status,
+        error: r.error,
+        providerMessageId: r.providerMessageId,
+      });
+    }
+  } else {
+    // Small list — send synchronously. Sequential keeps things simple; for
+    // production traffic this should be a queue worker.
+    for (const phone of valid) {
+      const result = await provider.send(phone, message, {
+        senderId,
+        clientRef: campaign.id,
+      });
+      counts[result.status]++;
+      addLog({
+        campaignId: campaign.id,
+        contactId: "manual",
+        contactName: "Manual recipient",
+        phone,
+        body: message,
+        status: result.status,
+        error: result.error,
+        providerMessageId: result.providerMessageId,
+      });
+    }
   }
 
   updateCampaign(campaign.id, {
-    status: counts.sent === 0 ? "failed" : "completed",
+    // If everything is still pending (e.g. real provider + webhook arriving
+    // later) keep status as "sending"; otherwise mark completed/failed.
+    status:
+      counts.pending > 0 && counts.sent === 0 && counts.failed === 0
+        ? "sending"
+        : counts.sent === 0
+          ? "failed"
+          : "completed",
     ...counts,
   });
 
@@ -95,6 +138,7 @@ export async function POST(request: Request) {
     {
       id: campaign.id,
       total: valid.length + invalidNumbers.length,
+      mode: useBroadcast ? "broadcast" : "single",
       ...counts,
       senderId: senderId ?? null,
     },

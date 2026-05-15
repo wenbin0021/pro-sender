@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { motion } from "motion/react";
 import {
   LayoutDashboard,
@@ -12,6 +12,7 @@ import {
   ScanSearch,
   Radio,
   Zap,
+  LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +28,19 @@ const NAV = [
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+
+  // The login page is a standalone screen — hide the workspace chrome.
+  if (pathname === "/login") return null;
+
+  async function handleLogout() {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      router.replace("/login");
+      router.refresh();
+    }
+  }
 
   return (
     <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar/80 backdrop-blur-xl">
@@ -109,6 +123,16 @@ export function AppSidebar() {
           <span className="text-[11px] text-muted-foreground">connected</span>
         </div>
       </div>
+
+      {/* Logout */}
+      <button
+        type="button"
+        onClick={handleLogout}
+        className="mx-3 mb-3 flex items-center gap-2 rounded-lg px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+      >
+        <LogOut className="h-4 w-4" strokeWidth={2} />
+        Sign out
+      </button>
     </aside>
   );
 }
