@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "setup": "node scripts/setup.mjs",
     "tunnel": "powershell -ExecutionPolicy Bypass -File scripts/dev-tunnel.ps1"
   },
   "dependencies": {
